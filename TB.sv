@@ -1,24 +1,29 @@
 `timescale 1ns / 1ps
-// Code your testbench here
-// or browse Examples
-// Code your testbench here
-// or browse Examples
+
 class transaction;
   
-  rand bit newd;
-  rand bit [11:0]din;
-  bit mosi, cs;
+  typedef enum bit{write = 1'b0, read = 1'b1}oper_type;
+  randc oper_type oper;
+  
+  bit newd;
+  rand bit [7:0]din;
+  
+  bit rx;
+  bit tx;
+  bit [7:0]dout;
+  bit donetx;
+  bit donerx;
   
   function transaction copy();
     copy = new();
     copy.newd = this.newd;
     copy.din = this.din;
-    copy.mosi = this.mosi;
-    copy.cs = this.cs;
-  endfunction
-  
-  function void display(input string tag);
-    $display("[%0s] :Newd: %0b \t CS:%0b \t Din:%0d \t MOSI:%0b",tag, newd, cs, din, mosi);
+    copy.rx = this.rx;
+    copy.tx = this.tx;
+    copy.dout = this.dout;
+    copy.donetx = this.donetx;
+    copy.donerx = this.rx;
+    copy.oper = this.oper;
   endfunction
   
 endclass
@@ -26,12 +31,13 @@ endclass
 class generator;
   
   transaction tr;
-  mailbox #(transaction)mbx;
-  int count = 0;
+  mailbox #(transaction) mbx;
   
   event done;
   event drvnext;
   event sconext;
+  
+  int count = 0;
   
   function new(mailbox #(transaction)mbx);
     this.mbx = mbx;
@@ -39,11 +45,10 @@ class generator;
   endfunction
   
   task run();
-    
     repeat(count)begin
-      assert(tr.randomize) else $display("Randomization Failed");
+    assert(tr.randomize) else $error("[DRV] : Randomization Failed");
       mbx.put(tr.copy);
-      tr.display("GEN");
+      $display("[GEN] : DIN : %0d \t Operation :%0s", tr.din, tr.oper.name());
       @(drvnext);
       @(sconext);
     end
@@ -54,50 +59,76 @@ endclass
 
 class driver;
   
- virtual spi_if vif;
- transaction tr;
-  mailbox #(transaction) mbx; 
-  mailbox #(bit [11:0]) mbxds;
+  transaction tr;
+  virtual uart_if vif;
   
-  function new(mailbox #(bit [11:0]) mbxds, mailbox #(transaction)mbx);
-    
+  mailbox #(transaction)mbx;
+  mailbox #(bit [7:0])mbxds;
+  
+  event drvnext;
+  bit [7:0] dinT;
+  
+  bit wr = 0;
+  bit [7:0] datarx;
+  
+  function new(mailbox #(transaction)mbx,  mailbox #(bit [7:0])mbxds);
     this.mbx = mbx;
     this.mbxds = mbxds;
   endfunction
   
-  event drvnext;
-  
-  bit [11:0]din;
-  
   task reset();
     vif.rst <= 1'b1;
-    vif.newd <= 1'b0;
-    vif.cs <= 1'b1;
-    vif.mosi <= 1'b0;
-    //vif.din <= 12'b0;
-     vif.din <= 1'b0;
-    
-    repeat(10)@(posedge vif.clk);
-       vif.rst <= 1'b0;
-    repeat(5)@(posedge vif.clk);
-    
-    $display("---------------------------");
-    $display("Reset Done");
-    
+    vif.din <= 0;
+    vif.newd <= 0;
+    vif.rx <= 1'b1;
+    repeat(5)@(posedge vif.uclktx);
+    vif.rst <= 1'b0;
+    @(posedge vif.uclktx);
+    $display("[DRV] : Reset Completed");
+    $display("-----------------------");
   endtask
   
   task run();
     forever begin
       mbx.get(tr);
-      @(posedge vif.sclk);
-      vif.newd <= 1'b1;
-      vif.din <= tr.din;
-      mbxds.put(tr.din);
-      @(posedge vif.sclk);
-      vif.newd <= 1'b0;
-      wait(vif.cs == 1'b1);
-      $display("Data Sent: %0d", tr.din);
-      ->drvnext;
+      
+      if(tr.oper == 1'b0)begin
+        @(posedge vif.uclktx);
+        vif.rst <= 1'b0;
+        vif.newd <= 1'b1;
+        vif.rx <= 1'b1;//Transmission has stopped
+        vif.din <= tr.din;
+        @(posedge vif.uclktx);
+        vif.newd <= 1'b0;
+        
+        mbxds.put(tr.din);
+        
+        $display("[DRV] : Data Sent : %0d", tr.din);
+        wait(vif.donetx == 1'b1);
+        ->drvnext;
+        
+      end
+      
+      else if(tr.oper == 1'b1)begin
+        
+        @(posedge vif.uclkrx);
+        vif.rst <= 1'b0;
+        vif.rx <= 1'b0;//Transmission Begins
+        vif.newd <= 1'b0;
+        @(posedge vif.uclkrx);
+        for(int i = 0; i < 8; i++)begin
+          @(posedge vif.uclkrx);
+          vif.rx <= $urandom;
+          datarx[i] = vif.rx;
+        end
+        
+        mbxds.put(datarx);
+        $display("[DRV] : Data RCVD : %0d", datarx);
+        wait(vif.donerx == 1'b1);
+        vif.rx <= 1'b1;
+        ->drvnext;
+      end
+      
     end
   endtask
   
@@ -106,44 +137,55 @@ endclass
 class monitor;
   
   transaction tr;
-  mailbox #(bit [11:0])mbx;
-  bit [11:0]srx;
   
-  virtual spi_if vif;
+  mailbox #(bit [7:0])mbx;
   
-  function new(mailbox #(bit [11:0])mbx);
-  	this.mbx = mbx;
+  bit [7:0] srx;//send
+  bit [7:0] rrx;//rcv
+  
+  virtual uart_if vif;
+  
+  function new(mailbox #(bit [7:0])mbx);
+    this.mbx = mbx;
   endfunction
   
   task run();
     forever begin
-      @(posedge vif.clk);
-      wait(vif.cs == 1'b0);////transaction begin
-      @(posedge vif.sclk);
       
-      for(int i = 0; i <12; i++)begin
-        @(posedge vif.sclk);
-        srx[i] = vif.mosi;
-      end
+      @(posedge vif.uclktx);
+      if((vif.newd == 1'b1)&&(vif.rx == 1'b1))begin
+        @(posedge vif.uclktx);///starts collecting tx data
+        for(int i = 0; i < 8; i++)begin
+          @(posedge vif.uclktx)
+          srx[i] = vif.tx;
+        end
+        $display("[MON] : Data Send on TX = %0d", srx);
+        @(posedge vif.uclktx);
+        mbx.put(srx);
+      end//if
       
-      wait(vif.cs == 1'b1);//transaction end
+      else if((vif.rx == 1'b0)&&(vif.newd == 1'b0))begin
+        wait(vif.donerx == 1);
+        rrx = vif.dout;
+        $display("[MON] : Data RCVD RX = %0d", rrx);
+        @(posedge vif.uclktx);
+        mbx.put(rrx);
+      end//elseif
       
-      $display("[MON]: Data Sent: %0d",srx);
-      mbx.put(srx);
-      
-    end
+    end//forever
   endtask
   
 endclass
 
 class scoreboard;
+  mailbox #(bit [7:0]) mbxds, mbxms;
   
-  mailbox #(bit [11:0]) mbxds, mbxms;
-  bit [11:0] ds;//data from driver;
-  bit [11:0] ms;//data from monitor;
+  bit [7:0] ds;
+  bit [7:0] ms;
+  
   event sconext;
   
-  function new(mailbox #(bit [11:0]) mbxds, mailbox #(bit [11:0])mbxms);
+  function new(mailbox #(bit [7:0])mbxds, mailbox #(bit [7:0])mbxms);
     this.mbxds = mbxds;
     this.mbxms = mbxms;
   endfunction
@@ -153,17 +195,12 @@ class scoreboard;
       mbxds.get(ds);
       mbxms.get(ms);
       
-      $display("[SCO]: DRV : %0d \t MON : %0d", ds, ms);
-      
-      if(ds == ms) $display(
-        "[SCO]: DATA MATCH"
-      );
-      
-      else $display(
-        "[SCO]: DATA MISMATCH"
-      );
-      $display("----------------------------------------");
+      $display("[SCO] : DRV : %0d \t MON : %0d", ds, ms);
+      if(ds == ms) $display("Data Matched");
+      else $display("Data Mismatched");
+      $display("-------------------------------");
       ->sconext;
+      
     end
   endtask
   
@@ -179,18 +216,20 @@ class environment;
   event nextgd;
   event nextgs;
   
-  mailbox #(transaction) mbxgd;
-  mailbox #(bit [11:0]) mbxds;
-  mailbox #(bit [11:0]) mbxms;
+  mailbox #(transaction)mbxgd;
+  mailbox #(bit [7:0]) mbxds;
+  mailbox #(bit [7:0]) mbxms;
   
-  virtual spi_if vif;
+  virtual uart_if vif;
   
-  function new(virtual spi_if vif);
+  function new(virtual uart_if vif);
+    
     mbxgd = new();
     mbxms = new();
     mbxds = new();
+    
     gen = new(mbxgd);
-    drv = new(mbxds, mbxgd);
+    drv = new(mbxgd, mbxds);
     
     mon = new(mbxms);
     sco = new(mbxds, mbxms);
@@ -212,7 +251,7 @@ class environment;
   endtask
   
   task test();
-    fork
+    fork 
       gen.run();
       drv.run();
       mon.run();
@@ -234,29 +273,33 @@ class environment;
 endclass
 
 module tb;
-  spi_if vif();
-  spi dut(.clk(vif.clk), .rst(vif.rst), .din(vif.din), .sclk(vif.sclk), .cs(vif.cs), .newd(vif.newd),
-          .mosi(vif.mosi));
+  uart_if vif();
+  
+  uart_top #(100000, 9600)dut
+  (
+    .clk(vif.clk), .rst(vif.rst), .newd(vif.newd), .rx(vif.rx), .din(vif.din),
+    .tx(vif.tx), .dout(vif.dout), .donetx(vif.donetx), .donerx(vif.donerx)
+  );
   
   initial begin
-    vif.clk <= 1'b0;
+    vif.clk = 1'b0;
   end
   
-  always #10 vif.clk <= ~vif.clk;//check for = instead <=
+  always #10 vif.clk <= ~vif.clk;
   
   environment env;
   
   initial begin
     env = new(vif);
-    env.gen.count = 20;
+    env.gen.count = 5;
     env.run();
-    
   end
   
-//   initial begin
-//    $dumpfile("dump.vcd");
-//    $dumpvars;
+//  initial begin
+//    $dumpfile("dump.vcd"); $dumpvars;
 //  end
   
-endmodule
+  assign vif.uclktx = dut.utx.uclk;
+  assign vif.uclkrx = dut.rtx.uclk;  
 
+endmodule
